@@ -1,0 +1,25 @@
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TABLE IF NOT EXISTS rides (
+  id UUID PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  driver_id TEXT,
+  status TEXT NOT NULL,
+  vehicle_type TEXT NOT NULL,
+  from_address TEXT NOT NULL,
+  to_address TEXT NOT NULL,
+  from_location GEOGRAPHY(POINT, 4326) NOT NULL,
+  to_location GEOGRAPHY(POINT, 4326) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ride_location_updates (
+  id BIGSERIAL PRIMARY KEY,
+  ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE CASCADE,
+  driver_id TEXT NOT NULL,
+  location GEOGRAPHY(POINT, 4326) NOT NULL,
+  speed_mps DOUBLE PRECISION,
+  heading DOUBLE PRECISION,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

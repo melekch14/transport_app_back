@@ -25,6 +25,15 @@ const pool = new Pool(
 const socketsByUser = new Map();
 const socketsByRide = new Map();
 
+function log(scope, message, meta = null) {
+  const ts = new Date().toISOString();
+  if (meta) {
+    console.log(`[${ts}] [${scope}] ${message}`, meta);
+    return;
+  }
+  console.log(`[${ts}] [${scope}] ${message}`);
+}
+
 const ensurePostgisSchema = `
 CREATE EXTENSION IF NOT EXISTS postgis;
 
@@ -58,7 +67,7 @@ async function ensureSchema() {
   const client = await pool.connect();
   try {
     await client.query(ensurePostgisSchema);
-    console.log('PostGIS schema ready');
+    log('db', 'PostGIS schema ready');
   } finally {
     client.release();
   }
@@ -119,6 +128,7 @@ app.get('/health', (_, res) => {
 app.get('/api/maps/search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
+    log('maps', 'search request', { q });
     if (!q) {
       res.json({ results: [] });
       return;
@@ -130,8 +140,10 @@ app.get('/api/maps/search', async (req, res) => {
       return;
     }
     const results = await googlePlacesTextSearch(q);
+    log('maps', 'search results', { count: results.length });
     res.json({ results });
   } catch (error) {
+    log('maps', 'search failed', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -140,6 +152,7 @@ app.get('/api/maps/reverse', async (req, res) => {
   try {
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
+    log('maps', 'reverse request', { lat, lng });
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       res.status(400).json({ error: 'lat/lng are required' });
       return;
@@ -151,8 +164,10 @@ app.get('/api/maps/reverse', async (req, res) => {
       return;
     }
     const result = await googleReverseGeocode(lat, lng);
+    log('maps', 'reverse resolved', { address: result.address });
     res.json(result);
   } catch (error) {
+    log('maps', 'reverse failed', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -160,6 +175,7 @@ app.get('/api/maps/reverse', async (req, res) => {
 app.post('/api/rides/request', async (req, res) => {
   try {
     const { id, clientId, from, to, vehicleType } = req.body || {};
+    log('ride', 'request received', { id, clientId, vehicleType });
     if (!id || !clientId || !from || !to || !vehicleType) {
       res.status(400).json({ error: 'id, clientId, from, to, vehicleType are required' });
       return;
@@ -206,9 +222,14 @@ app.post('/api/rides/request', async (req, res) => {
         sendJson(ws, event);
       }
     }
+    const driversOnline = [...socketsByUser.keys()].filter((k) =>
+      k.startsWith('driver:'),
+    ).length;
+    log('ride', 'request dispatched to drivers', { id, driversOnline });
 
     res.status(201).json({ rideId: id });
   } catch (error) {
+    log('ride', 'request failed', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -217,6 +238,7 @@ app.post('/api/rides/:rideId/accept', async (req, res) => {
   try {
     const { rideId } = req.params;
     const { driverId } = req.body || {};
+    log('ride', 'accept request', { rideId, driverId });
     if (!driverId) {
       res.status(400).json({ error: 'driverId is required' });
       return;
@@ -238,6 +260,7 @@ app.post('/api/rides/:rideId/accept', async (req, res) => {
     }
 
     const ride = result.rows[0];
+    log('ride', 'accepted', { rideId, driverId, clientId: ride.client_id });
     broadcastRide(rideId, {
       type: 'ride_accepted',
       rideId,
@@ -258,6 +281,7 @@ app.post('/api/rides/:rideId/accept', async (req, res) => {
 
     res.json({ ok: true, rideId, driverId });
   } catch (error) {
+    log('ride', 'accept failed', { rideId: req.params.rideId, error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -301,8 +325,17 @@ app.post('/api/rides/:rideId/driver-location', async (req, res) => {
       if (ws) sendJson(ws, payload);
     }
 
+    log('ride', 'driver location update', {
+      rideId,
+      driverId,
+      lat,
+      lng,
+      clientId: clientId || null,
+    });
+
     res.json({ ok: true });
   } catch (error) {
+    log('ride', 'driver location failed', { rideId: req.params.rideId, error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -361,10 +394,17 @@ wss.on('connection', (ws, req) => {
   }
 
   sendJson(ws, { type: 'ws_connected', role, userId, rideId });
+  log('ws', 'connected', {
+    role,
+    userId,
+    rideId,
+    users: socketsByUser.size,
+  });
 
   ws.on('message', async (raw) => {
     try {
       const message = JSON.parse(raw.toString());
+      log('ws', 'message', { role, userId, type: message.type, rideId: message.rideId || null });
       if (message.type === 'subscribe_ride' && message.rideId) {
         const subscribers = socketsByRide.get(message.rideId) || new Set();
         subscribers.add(ws);
@@ -388,6 +428,7 @@ wss.on('connection', (ws, req) => {
         broadcastRide(message.rideId, payload);
       }
     } catch (error) {
+      log('ws', 'message parse failed', { error: error.message });
       sendJson(ws, { type: 'ws_error', error: error.message });
     }
   });
@@ -402,13 +443,23 @@ wss.on('connection', (ws, req) => {
         socketsByRide.delete(id);
       }
     }
+    log('ws', 'closed', {
+      role,
+      userId,
+      users: socketsByUser.size,
+    });
   });
 });
 
 ensureSchema()
   .then(() => {
     server.listen(PORT, () => {
-      console.log(`Backend running at http://localhost:${PORT}`);
+      log('boot', 'backend started', {
+        url: `http://localhost:${PORT}`,
+        autoMigrate: AUTO_MIGRATE,
+        hasDatabaseUrl: Boolean(DATABASE_URL),
+        hasGoogleMapsKey: Boolean(GOOGLE_MAPS_API_KEY),
+      });
     });
   })
   .catch((error) => {

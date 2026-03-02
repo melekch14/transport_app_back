@@ -121,6 +121,80 @@ async function googleReverseGeocode(lat, lng) {
   };
 }
 
+function decodePolyline(encoded) {
+  const points = [];
+  let index = 0;
+  let lat = 0;
+  let lng = 0;
+
+  while (index < encoded.length) {
+    let b;
+    let shift = 0;
+    let result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    const dlat = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lat += dlat;
+
+    shift = 0;
+    result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    const dlng = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lng += dlng;
+
+    points.push({
+      lat: lat / 1e5,
+      lng: lng / 1e5,
+    });
+  }
+
+  return points;
+}
+
+async function googleDirectionsRoute({
+  originLat,
+  originLng,
+  destLat,
+  destLng,
+}) {
+  const url = new URL('https://maps.googleapis.com/maps/api/directions/json');
+  url.searchParams.set('origin', `${originLat},${originLng}`);
+  url.searchParams.set('destination', `${destLat},${destLng}`);
+  url.searchParams.set('mode', 'driving');
+  url.searchParams.set('key', GOOGLE_MAPS_API_KEY);
+  url.searchParams.set('region', 'tn');
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Google Directions request failed with ${response.status}`);
+  }
+
+  const data = await response.json();
+  const route = data.routes?.[0];
+  const leg = route?.legs?.[0];
+  const encoded = route?.overview_polyline?.points;
+  if (!encoded || !leg) {
+    return {
+      points: [],
+      distanceText: '',
+      durationText: '',
+    };
+  }
+
+  return {
+    points: decodePolyline(encoded),
+    distanceText: leg.distance?.text || '',
+    durationText: leg.duration?.text || '',
+  };
+}
+
 app.get('/health', (_, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
@@ -168,6 +242,54 @@ app.get('/api/maps/reverse', async (req, res) => {
     res.json(result);
   } catch (error) {
     log('maps', 'reverse failed', { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/maps/route', async (req, res) => {
+  try {
+    const originLat = Number(req.query.originLat);
+    const originLng = Number(req.query.originLng);
+    const destLat = Number(req.query.destLat);
+    const destLng = Number(req.query.destLng);
+
+    log('maps', 'route request', {
+      originLat,
+      originLng,
+      destLat,
+      destLng,
+    });
+
+    if (
+      !Number.isFinite(originLat) ||
+      !Number.isFinite(originLng) ||
+      !Number.isFinite(destLat) ||
+      !Number.isFinite(destLng)
+    ) {
+      res.status(400).json({ error: 'origin/destination coordinates are required' });
+      return;
+    }
+    if (!GOOGLE_MAPS_API_KEY) {
+      res.status(500).json({
+        error: 'GOOGLE_MAPS_API_KEY is missing on backend',
+      });
+      return;
+    }
+
+    const route = await googleDirectionsRoute({
+      originLat,
+      originLng,
+      destLat,
+      destLng,
+    });
+    log('maps', 'route resolved', {
+      points: route.points.length,
+      distance: route.distanceText,
+      duration: route.durationText,
+    });
+    res.json(route);
+  } catch (error) {
+    log('maps', 'route failed', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -450,6 +572,58 @@ wss.on('connection', (ws, req) => {
     rideId,
     users: socketsByUser.size,
   });
+
+  if (role === 'driver') {
+    pool
+      .query(
+        `
+        SELECT
+          id,
+          client_id,
+          vehicle_type,
+          from_address,
+          to_address,
+          ST_Y(from_location::geometry) AS from_lat,
+          ST_X(from_location::geometry) AS from_lng,
+          ST_Y(to_location::geometry) AS to_lat,
+          ST_X(to_location::geometry) AS to_lng
+        FROM rides
+        WHERE status = 'requested' AND driver_id IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+      )
+      .then((result) => {
+        if (!result.rowCount) return;
+        const row = result.rows[0];
+        sendJson(ws, {
+          type: 'ride_requested',
+          ride: {
+            id: row.id,
+            clientId: row.client_id,
+            vehicleType: row.vehicle_type,
+            status: 'requested',
+            from: {
+              address: row.from_address,
+              lat: Number(row.from_lat),
+              lng: Number(row.from_lng),
+            },
+            to: {
+              address: row.to_address,
+              lat: Number(row.to_lat),
+              lng: Number(row.to_lng),
+            },
+          },
+        });
+        log('ws', 'replayed pending ride to driver', {
+          driverId: userId,
+          rideId: row.id,
+        });
+      })
+      .catch((error) => {
+        log('ws', 'failed to replay pending ride', { error: error.message });
+      });
+  }
 
   ws.on('message', async (raw) => {
     try {

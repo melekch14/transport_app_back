@@ -158,6 +158,13 @@ function decodePolyline(encoded) {
   return points;
 }
 
+function stripHtml(html) {
+  return String(html || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function googleDirectionsRoute({
   originLat,
   originLng,
@@ -185,6 +192,7 @@ async function googleDirectionsRoute({
       points: [],
       distanceText: '',
       durationText: '',
+      steps: [],
     };
   }
 
@@ -192,6 +200,20 @@ async function googleDirectionsRoute({
     points: decodePolyline(encoded),
     distanceText: leg.distance?.text || '',
     durationText: leg.duration?.text || '',
+    steps: (leg.steps || []).map((step) => ({
+      instruction: stripHtml(step.html_instructions),
+      distanceText: step.distance?.text || '',
+      durationText: step.duration?.text || '',
+      maneuver: step.maneuver || '',
+      start: {
+        lat: step.start_location?.lat ?? null,
+        lng: step.start_location?.lng ?? null,
+      },
+      end: {
+        lat: step.end_location?.lat ?? null,
+        lng: step.end_location?.lng ?? null,
+      },
+    })),
   };
 }
 

@@ -340,6 +340,56 @@ app.post('/api/rides/:rideId/driver-location', async (req, res) => {
   }
 });
 
+app.post('/api/rides/:rideId/complete', async (req, res) => {
+  try {
+    const { rideId } = req.params;
+    const { driverId } = req.body || {};
+    if (!driverId) {
+      res.status(400).json({ error: 'driverId is required' });
+      return;
+    }
+
+    log('ride', 'complete request', { rideId, driverId });
+    const result = await pool.query(
+      `
+      UPDATE rides
+      SET status = 'completed', updated_at = NOW()
+      WHERE id = $1 AND driver_id = $2
+      RETURNING id, client_id, driver_id, status
+      `,
+      [rideId, driverId],
+    );
+
+    if (!result.rowCount) {
+      res.status(404).json({ error: 'ride not found for this driver' });
+      return;
+    }
+
+    const ride = result.rows[0];
+    const payload = {
+      type: 'ride_completed',
+      rideId,
+      driverId: ride.driver_id,
+      clientId: ride.client_id,
+      status: ride.status,
+    };
+    broadcastRide(rideId, payload);
+    const clientSocket = socketsByUser.get(`client:${ride.client_id}`);
+    if (clientSocket) {
+      sendJson(clientSocket, payload);
+    }
+    const driverSocket = socketsByUser.get(`driver:${ride.driver_id}`);
+    if (driverSocket) {
+      sendJson(driverSocket, payload);
+    }
+    log('ride', 'completed', { rideId, driverId: ride.driver_id, clientId: ride.client_id });
+    res.json({ ok: true, rideId });
+  } catch (error) {
+    log('ride', 'complete failed', { rideId: req.params.rideId, error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/rides/:rideId', async (req, res) => {
   try {
     const { rideId } = req.params;
